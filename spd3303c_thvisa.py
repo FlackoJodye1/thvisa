@@ -1,137 +1,246 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Fri Dec  6 21:37:06 2019
+Created on Sat Nov 16 18:23:02 2019
 
 @author: thirschbuechler
 """
+# re-invent the wheel, because python-ivi seems pretty dead, unfortunately.
+import sys
+import visa
+import numpy as np
 import time
-import thvisa as thv
+import string
+#from enum import Enum
 
-# ToDo: check system:status? to find out whether in cc mode, i.e. limited
-# ToDo: series / parallel mode
-# ToDo: find out whether lock-mode exists (spam commands, ref. manual doesn't say)
+# ToDo:
+# more visa error types to see why instr doesn't always behave on init (psu does now)
 
-# ToDo: check for human goblins (i.e. measure voltage each time after it
-#           got set to verify it hasn't been changed while 1s in unlocked mode)
-#       maybe as locklevel (0=none, 1=lock, 2=lock + while(not confirmed when locked))
-#       aka level=[engineer, user, toddler]
-# right now this is setp
+def printdummy(*args):
+    pass
 
-class spd3303c(thv.thInstr):
 
-    # overwrite class inherited defaults
-    myprintdef = print
-    instrnamedef = "NPD"
-    qdelaydef = 1
-    
-    
-    ## instrument setup ##
-    def __init__(self, instrname = instrnamedef, qdelay = qdelaydef, myprint = myprintdef, settletime=1):
-        self.qdelay=qdelay
+statedict = {
+       True: "On",
+       False: "Off"}
+
+class thInstr(object):
+    # Python3 object orientation:
+    # first parameter "object" for inheritence can be ignored
+    # the "self" parameter of subfunctions can't be ingored internally, only externally
+    # i.e. the __init__-constructor has do specify self,
+    # but calling it from the main loop just ignore it,
+    # i.e. instance = myclass(), then myclass.fct(parameter1, parameter2, ..)
+    # , param0=self=omitted
+
+    # default attributes for child-classes
+    myprintdef = printdummy
+    instrnamedef = 0
+    qdelaydef = 0
+    # Initializer / Instance Attributes
+    def __init__(self, instrname = instrnamedef, qdelay = qdelaydef, myprint = myprintdef, wdelay = 0):
+
         self.myprint=myprint
-        self.instrname=instrname
-        self.settletime=settletime
+        self.myinstruments = []
+        self.instr = 0
+        self.instrname = instrname
+        self.wdelay = wdelay
         
-        # call parent init #
-        # the righthand stuff has to be "self." properties and unusually, has no ".self" prefix
-        super(spd3303c, self).__init__(myprint=myprint, instrname=instrname, qdelay=qdelay, wdelay=0.10)
-        self.alwayscheck=False # screw error checking every time, now we need wdelay=100ms instead of 10ms but are overall faster
+        self.myprint("looking for instr name {}.. listing instruments shortly..".format(self.instrname))
+        try:
+            self.rm = visa.ResourceManager()
+            instruments = np.array(self.rm.list_resources())
+        except OSError: # not of visa but OS
+           self.myprint("OS error, maybe restart PC/RPI or library not found?")
+           sys.exit(0)
 
-        # define output state, should be off, but nonetheless:
-        # can't do here, no handle open! make one with "with" or omit
-        # self.disable(1)
-        # self.disable(2)
-        
-        
-    def __exit__(self, exc_type, exc_value, tb):# "with" context exit
-        self.do_command( "*unlock") # return full control, was partially locked anyhow
-        super(spd3303c, self).__exit__( exc_type, exc_value, tb) # call inherited fct
+        # this only works sometimes.. pyvisa.. catch general exception
+        # for some reason, it's lucky to query the keysight oszi first...
 
-            
-    ## auxiliary setup ##
-    def set_settletime(self,newsettletime): 
-            self.settletime = newsettletime # waittime for transients to settle
+        self.myprint("querying instruments..")
+        if len(instruments)<0:
+            self.myprint("no instruments: sad puppy.")
+        else:
+            self.myprint("say hello")
+            for instrument in instruments:
+                self.myprint(instrument)
+                try:
+                    delay=0.5
+                    # toDo: don't hardcode here
+                    if "SPD" in instrument: #spd3303c needs delay at init
+                        delay=1
 
-    def test_undoc_cmd(self): # no {preset, reset, factory, *rst, *cls, *tst, syst:pres, *OPC?} comands
-        self.do_command("*unlock") # output can only be changed in unlocked state
-        self.do_command( "*OPC?")
-        #self.beep()
-        
-    def beep(self): # upset instrument by sending garbage
-        self.do_command( "beep")
+                    with self.rm.open_resource(instrument, query_delay = delay) as my_instrument:
+                        # "with"context cleans class up after use / when dying
+                        # better than deconstructor: https://eli.thegreenplace.net/2009/06/12/safely-using-destructors-in-python/
+                        identity = my_instrument.query('*IDN?')
+                        self.myprint("Resource: '" + instrument + "' is" + identity + '\n')
+                        self.myinstruments.append(instrument)
 
+                    #self.myprint("cleanup after idn")
+                    #my_instrument.close() # shut down # gets called by __del__ of rm
+                    # as seen here (https://pyvisa.readthedocs.io/en/latest/_modules/pyvisa/highlevel.html#ResourceManager.close)
+                    #del my_instrument
 
-    ## control functions ##
-    # outsourced from "set" to make user think whether to turn it on immediately after setting #        
-    def output(self, ch, state=float("nan")):
-        self.myprint('PSU channel {}:'.format(str(ch)))
-        self.do_command("*unlock") # output can only be changed in unlocked state
-        self.do_command('OUTP CH{}, {}'.format(str(ch), thv.statedict[state]))
-        self.do_command("*lock")
-                
-        # todo: $use eggtimer / mysleep to avoid UI freeze
-        time.sleep(self.settletime) # wait for off-transient
-
-        
-    # synonyms #
-    def enable(self, ch):
-        self.output(ch=ch, state=True)
-        
-    def disable(self, ch):
-        self.output(ch=ch, state=False)
-
-
-    ## parameter setting ##
-    # per channel, since independent #
-    def set(self, ch=float('nan'), v_set = float('nan'), c_max = float('nan')):
-        self.myprint("Setting channel {} parameters:".format(str(ch)))
-        
-        self.do_command("*unlock") # output can only be changed in unlocked state
-        self.do_command('CH%i:VOLTage, %2.2f' % (ch,v_set))
-        self.do_command('CH%i:CURRent, %2.2f' % (ch,c_max))
-        self.do_command("*lock") 
+                except visa.VisaIOError:
+                   self.myprint('VisaError: No connection to: ' + instrument+", maybe chunk size or msg timeout, query_delay")
+                   # like VisaIOError.VI_ERROR_INV_SETUP VisaIOError.VI_ERROR_CONN_LOST:
+                except visa.InvalidSession:
+                    self.myprint("VisaError: session closed before access") # tested via closing session before "IDN?"
+                except visa.VisaIOWarning:
+                   self.myprint("VisaError:  VisaIOWarning")
+                except OSError: # not of visa but OS
+                   self.myprint("OS error, maybe library not found?")
+                except:
+                   self.myprint("VisaError:  Unexpected error:", sys.exc_info()[0])
+                   self.myprint("maybe resource busy , i.e. increase query_delay or unplug-replug"+"\n"+"or already taken by other/older session, if you didn't use a \"with\"-context")
 
 
-    # doesn't work due to dmm_results
-    def setp(self, ch=float('nan'), v_set = float('nan'), c_max = float('nan')): # paranoid variant, assume someone may hit V/I wheel       
-        while (not (self.DMM_results(ch)==[v_set,c_max])):
-            self.set(ch , v_set, c_max)
+        # intendation level: __init__
+        # now, if name specified, return thing
+        if self.instrname:
+            self.instr=(self.getinstrument(instrname, qdelay=qdelay))
+            self.instrname=instrname
+        else:
+            self.myprint("you made no wish, you you aren't gettin' any!")#$do something?
+            #return(0)
+
+    # end __init__
+
+    def getinstrument(self, name,qdelay=0): #name segment as input
+
+        for instrument in self.myinstruments:
+            if name in instrument:
+                return(self.rm.open_resource(instrument, query_delay=qdelay)) #exits on first find
+
+        #else, this happens:
+        self.myprint("oh noes, requested instrument not found!")#$do something?
+        sys.exit(0)
 
 
-    ## DMM functions ##
-    # don't work reliably, for some reason, waiting doesn't seem to help,
-    # also appends \n \x00 \x00 or something
-    # approximate, take with grain of salt #
-    def DMM_results(self, ch=float("nan")):
-        #$todo if-else or switch-case
-        v=self.do_query_number("Measure:Voltage? CH{}".format(str(ch)))
-        time.sleep(1)
-        c=self.do_query_number("Measure:Current? CH{}".format(str(ch)))
-        time.sleep(1)
-        self.myprint(v)
-        self.myprint(c)
-        return [float(v),float(c)]
+    # depreciated: do commands as class functions, not externally
+    #def getrm(self):
+    #    return(self.rm)
+
+
+    # if needs some mod after init routine
+    def setprint(self, function): # to redirect print to pdf, print, etc.
+    	self.myprint=function
+
+
+    def visa_write_delayed(self, visa,msg,wait_time_ms = 100):
+
+        err_flag = visa.write(msg)
+        time.sleep(wait_time_ms/1000)
+        return err_flag
+
+
+    # =========================================================
+    # Send a command and check for errors:
+    # =========================================================
+    def do_command(self, command, hide_params=False):
+
+        if hide_params:
+            (header, data) = string.split(command, " ", 1)
+            self.myprint("\nCmd = '%s'" % header)
+        else:
+            self.myprint("\nCmd = '%s'" % command)
+
+        self.instr.write("{}".format(command))
+
+        #if hide_params:
+         #   self.check_instrument_errors(header)
+        #else:â€
+         #   self.check_instrument_errors(command)
+
+
+    # =========================================================
+    # Send a command and binary values and check for errors:
+    # =========================================================
+    def do_command_ieee_block(self, command, values):
+
+        self.myprint("Cmb = '%s'" % command)
+        self.instr.write_binary_values("%s " % command, values, datatype='c')
+        self.check_instrument_errors(command)
+
+
+    # =========================================================
+    # Send a query, check for errors, return string:
+    # =========================================================
+    def do_query_string(self, query):
+
+        self.myprint("Qys = '%s'" % query)
+        result = self.instr.query("%s" % query)
+        self.check_instrument_errors(query)
+        return result
+
+
+    # =========================================================
+    # Send a query, check for errors, return floating-point value:
+    # =========================================================
+    def do_query_number(self, query):
+
+        self.myprint("Qyn = '%s'" % query)
+        results = self.instr.query("%s" % query)
+        self.check_instrument_errors(query)
+        return float(results)
+
+
+    # =========================================================
+    # Send a query, check for errors, return binary values:
+    # =========================================================
+    def do_query_ieee_block(self, query):
+
+        self.myprint("Qys = '%s'" % query)
+        result = self.instr.query_binary_values("%s" % query, datatype='s')
+        self.check_instrument_errors(query)
+        return result[0]
+
+
+    # =========================================================
+    # Check for instrument errors:
+    # =========================================================
+    def check_instrument_errors(self, command):
+
+        while True:
+            error_string = self.instr.query(":SYSTem:ERRor?")
+            if error_string: # If there is an error string value.
+                error_string = error_string.strip("ERROR: ") # remove that
+                error_string = error_string.strip("+") # remove that
+                if error_string.find("0", 0, 1) == -1: # Not "ERROR: 0  No Error"
+                   self.myprint("ERROR: %s, command: '%s'" % (error_string, command))
+                   self.myprint("Exiting on error.")
+                   self.myprint("i can see my house from up here")
+                   sys.exit(1)
+                else: # "No error"
+                    break
+            else: # :SYSTem:ERRor? should always return string.
+               self.myprint("ERROR: :SYSTem:ERRor? returned nothing, command: '%s'" % command)
+               self.myprint("Exiting due to error.")
+               sys.exit(1)
+    
+    
+    def __del__(self):
+        #self.instr.close() # shut down # gets called by __del__ of rm
+        # as seen here (https://pyvisa.readthedocs.io/en/latest/_modules/pyvisa/highlevel.html#ResourceManager.close)
+        if (self.instr):
+            self.instr.close()
+            self.myprint("say goodbye, instrument {}!".format(self.instrname))
+
+    
+    def __exit__(self, exc_type, exc_value, tb):# "with" context exit: call del
+        self.__del__() # kill, kill!
+        #return True
+    
+    
+    def __enter__(self):# Qwith" context entered: do nothing other than init
+        #self.__init__() # come to life
+        #return True
+        return self
+
 
 ### module test ###
-if __name__ == '__main__': # test if called as executable, not as library, regular prints allowed
-    #psu = spd3303c("NPD",qdelay=1,myprint=print) # no, use with-context!
-    with spd3303c() as psu:
-        psu.disable(1)
-        psu.disable(2)
-        #psu.test_undoc_cmd()
-        
-        #time.sleep(1)
-        #print(psu.do_query_string("Measure:Voltage? CH{}".format(str(1))))
-        print("major range change to make it kachunck")
-        psu.set(ch=1, v_set=30, c_max=0.1)
-        psu.set(ch=2, v_set=5, c_max=0.1)
-        #print(psu.do_query_string("Measure:Voltage? CH{}".format(str(1))))
+if __name__ == '__main__': # test if called as executable, not as library
+    myinstr = thInstr(myprint=print)
 
-        psu.enable(ch=1)
-        psu.set(ch=1, v_set=5, c_max=0.1)
-        #print(psu.do_query_string("Measure:Voltage? CH{}".format(str(1))))
-
-        psu.disable(ch=1)
-    #del psu # the "with" context automatically calls the de-constructur and ends the session
-    # please use it to avoid dead sessions, which result in the necessity to reboot the instrument and also the PC at times!!
+    #todo: test all functions, or specify to run other module which does.. really!!
